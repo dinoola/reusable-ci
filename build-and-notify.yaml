@@ -1,3 +1,102 @@
+# name: Build and Notify
+
+# on:
+#   workflow_call:
+#     outputs:
+#       artifact_name:
+#         description: "Uploaded artifact name"
+#         value: ${{ jobs.build_and_notify.outputs.artifact_name }}
+#       slack_ts:
+#         description: "Slack message timestamp"
+#         value: ${{ jobs.build_and_notify.outputs.slack_ts }}
+#     secrets:
+#       SLACK_BOT_TOKEN_CI:
+#         required: true
+
+# jobs:
+#   build_and_notify:
+#     runs-on: self-hosted
+#     outputs:
+#       artifact_name: ${{ steps.upload.outputs.artifact_name }}
+#       slack_ts: ${{ steps.slack.outputs.slack_ts }}
+
+#     steps:
+#       - name: Checkout pt-zh-web repo
+#         uses: actions/checkout@v3
+#         with:
+#           fetch-depth: 0
+
+#       - name: Setup Node.js
+#         uses: actions/setup-node@v3
+#         with:
+#           node-version: '18'
+
+#       - name: Setup pnpm
+#         uses: pnpm/action-setup@v2
+#         with:
+#           version: 8
+
+#       - name: Identify and build changed projects
+#         run: |
+#           pnpm ls --depth -1 --json --filter "[${{ github.event.before }}...${{ github.sha }}]" > packages.json
+#           node scripts/ci/build-changed-projects.js
+
+#       - name: Upload built dist folders as artifacts
+#         id: upload
+#         uses: actions/upload-artifact@v4
+#         with:
+#           name: dist-artifacts-${{ github.sha }}
+#           path: ./artifacts/**
+
+#       - name: Save artifact name as output
+#         run: echo "artifact_name=dist-artifacts-${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+#       - name: Notify Slack with summary
+#         id: slack
+#         env:
+#           SLACK_BOT_TOKEN_CI: ${{ secrets.SLACK_BOT_TOKEN_CI }}
+#         run: |
+#           SUMMARY=$(cat build-summary.json)
+
+#           BUILT=$(echo "$SUMMARY" | jq -r '.built[]?' | sed 's/^/- /' | paste -sd '\n' -)
+#           FAILED=$(echo "$SUMMARY" | jq -r '
+#             if (.failed | length) > 0 then
+#               .failed[] | "- " + (.name // "unknown") + ": " + (.reason // "no reason") + "\n" + (.detail // "")
+#             else
+#               empty
+#             end
+#           ' | paste -sd '\n\n' -)
+
+#           [ -z "$BUILT" ] && BUILT="(none)"
+#           [ -z "$FAILED" ] && FAILED="(none)"
+
+#           FAIL_COUNT=$(echo "$SUMMARY" | jq '.failed | length')
+
+#           if [ "$FAIL_COUNT" -gt 0 ]; then
+#             TEXT="❌ CI build failed on branch *${{ github.ref_name }}*"
+#           else
+#             TEXT="✅ CI build succeeded on branch *${{ github.ref_name }}*"
+#           fi
+
+#           MESSAGE=$(echo -e "$TEXT\n\n*Projects built:*\n$BUILT\n\n*Failures:*\n$FAILED")
+
+#           CHANNEL_ID="C08TGT4TBGT"
+#           SLACK_RESPONSE=$(curl -s -X POST \
+#             -H "Authorization: Bearer $SLACK_BOT_TOKEN_CI" \
+#             -H "Content-type: application/json" \
+#             --data "$(jq -n --arg channel "$CHANNEL_ID" --arg text "$MESSAGE" '{channel: $channel, text: $text}')" \
+#             https://slack.com/api/chat.postMessage)
+
+#           TIMESTAMP=$(echo "$SLACK_RESPONSE" | jq -r '.ts // empty')
+#           if [ -n "$TIMESTAMP" ]; then
+#             echo "🕒 Slack message timestamp: $TIMESTAMP"
+#             echo "slack_ts=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+#           else
+#             echo "⚠️ Failed to extract timestamp from response: $SLACK_RESPONSE"
+#           fi
+
+
+
 name: Build and Notify
 
 on:
@@ -12,16 +111,28 @@ on:
     secrets:
       SLACK_BOT_TOKEN_CI:
         required: true
+      SLACK_CHANNEL_ID:
+        required: true
+      REPO_GITHUB_TOKEN:
+        required: true
+
+env:
+  REPOSITORY: ${{ github.repository }}
+  BRANCH: ${{ github.ref_name }}
+  WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  ACTOR: ${{ github.actor }}
+  HOST: 'pt-h5.sgola.cc'
+  ALIYUN_FLOW_URL: 'https://flow.aliyun.com/pipelines/2493185/current'
 
 jobs:
   build_and_notify:
     runs-on: self-hosted
     outputs:
       artifact_name: ${{ steps.upload.outputs.artifact_name }}
-      slack_ts: ${{ steps.slack.outputs.slack_ts }}
+      slack_ts: ${{ steps.slack_notify.outputs.ts }}
 
     steps:
-      - name: Checkout pt-zh-web repo
+      - name: Checkout repository
         uses: actions/checkout@v3
         with:
           fetch-depth: 0
@@ -41,56 +152,68 @@ jobs:
           pnpm ls --depth -1 --json --filter "[${{ github.event.before }}...${{ github.sha }}]" > packages.json
           node scripts/ci/build-changed-projects.js
 
-      - name: Upload built dist folders as artifacts
+      - name: Determine built folders and commit summary
+        id: prepare_metadata
+        run: |
+          MODIFIED_FOLDER=$(jq -r '.built[]?' build-summary.json | paste -sd ' ')
+          BUILD_RESULT=$(jq -r '.built[]? // empty | ":sep:\(.) built successfully"' build-summary.json; jq -r '.failed[]? // empty | ":sep:\(.name): \(.reason)"' build-summary.json)
+          echo "MODIFIED_FOLDER=$MODIFIED_FOLDER" >> $GITHUB_ENV
+          echo "BUILD_RESULT=$BUILD_RESULT" >> $GITHUB_ENV
+
+      - name: Download send_slack.py
+        run: |
+          curl -o send_slack.py -H "Authorization: token ${{ secrets.REPO_GITHUB_TOKEN }}" https://raw.githubusercontent.com/olachat/pt-ci/main/h5/send_slack.py
+          chmod +x send_slack.py
+
+      - name: Send Slack - Processing
+        id: slack_notify
+        run: |
+          TS=$(./send_slack.py \
+            --token ${{ secrets.SLACK_BOT_TOKEN_CI }} \
+            --channel ${{ secrets.SLACK_CHANNEL_ID }} \
+            --repository "${{ env.REPOSITORY }}" \
+            --branch "${{ env.BRANCH }}" \
+            --status processing \
+            --workflow "${{ env.WORKFLOW_URL }}" \
+            --sender "${{ env.ACTOR }}" \
+            --host "${{ env.HOST }}" \
+            --flow_url "${{ env.ALIYUN_FLOW_URL }}" \
+            --folder "${{ env.MODIFIED_FOLDER }}" \
+            --result "${{ env.BUILD_RESULT }}"
+          )
+          echo "ts=$TS" >> $GITHUB_OUTPUT
+
+      - name: Upload built artifacts
         id: upload
         uses: actions/upload-artifact@v4
         with:
           name: dist-artifacts-${{ github.sha }}
           path: ./artifacts/**
+          if-no-files-found: warn
 
       - name: Save artifact name as output
         run: echo "artifact_name=dist-artifacts-${{ github.sha }}" >> "$GITHUB_OUTPUT"
 
-      - name: Notify Slack with summary
-        id: slack
-        env:
-          SLACK_BOT_TOKEN_CI: ${{ secrets.SLACK_BOT_TOKEN_CI }}
+      - name: Update Slack message with final status
+        if: always() && !cancelled()
         run: |
-          SUMMARY=$(cat build-summary.json)
-
-          BUILT=$(echo "$SUMMARY" | jq -r '.built[]?' | sed 's/^/- /' | paste -sd '\n' -)
-          FAILED=$(echo "$SUMMARY" | jq -r '
-            if (.failed | length) > 0 then
-              .failed[] | "- " + (.name // "unknown") + ": " + (.reason // "no reason") + "\n" + (.detail // "")
-            else
-              empty
-            end
-          ' | paste -sd '\n\n' -)
-
-          [ -z "$BUILT" ] && BUILT="(none)"
-          [ -z "$FAILED" ] && FAILED="(none)"
-
-          FAIL_COUNT=$(echo "$SUMMARY" | jq '.failed | length')
-
-          if [ "$FAIL_COUNT" -gt 0 ]; then
-            TEXT="❌ CI build failed on branch *${{ github.ref_name }}*"
-          else
-            TEXT="✅ CI build succeeded on branch *${{ github.ref_name }}*"
+          STATUS="failed"
+          if [[ "${{ job.status }}" == "success" && "$MODIFIED_FOLDER" != "" ]]; then
+            STATUS="copying_files"
+          elif [[ "${{ job.status }}" == "success" ]]; then
+            STATUS="no_files"
           fi
 
-          MESSAGE=$(echo -e "$TEXT\n\n*Projects built:*\n$BUILT\n\n*Failures:*\n$FAILED")
-
-          CHANNEL_ID="C08TGT4TBGT"
-          SLACK_RESPONSE=$(curl -s -X POST \
-            -H "Authorization: Bearer $SLACK_BOT_TOKEN_CI" \
-            -H "Content-type: application/json" \
-            --data "$(jq -n --arg channel "$CHANNEL_ID" --arg text "$MESSAGE" '{channel: $channel, text: $text}')" \
-            https://slack.com/api/chat.postMessage)
-
-          TIMESTAMP=$(echo "$SLACK_RESPONSE" | jq -r '.ts // empty')
-          if [ -n "$TIMESTAMP" ]; then
-            echo "🕒 Slack message timestamp: $TIMESTAMP"
-            echo "slack_ts=$TIMESTAMP" >> "$GITHUB_OUTPUT"
-          else
-            echo "⚠️ Failed to extract timestamp from response: $SLACK_RESPONSE"
-          fi
+          ./send_slack.py \
+            --update_ts "${{ steps.slack_notify.outputs.ts }}" \
+            --token ${{ secrets.SLACK_BOT_TOKEN_CI }} \
+            --channel ${{ secrets.SLACK_CHANNEL_ID }} \
+            --repository "${{ env.REPOSITORY }}" \
+            --branch "${{ env.BRANCH }}" \
+            --status "$STATUS" \
+            --workflow "${{ env.WORKFLOW_URL }}" \
+            --sender "${{ env.ACTOR }}" \
+            --host "${{ env.HOST }}" \
+            --flow_url "${{ env.ALIYUN_FLOW_URL }}" \
+            --folder "${{ env.MODIFIED_FOLDER }}" \
+            --result "${{ env.BUILD_RESULT }}"
